@@ -20,6 +20,9 @@ chartCategoricalColors = [
   "#F97316",
 ]
 
+[server]
+address = "127.0.0.1"
+
 [theme.sidebar]
 backgroundColor = "#0E1728"
 secondaryBackgroundColor = "#111B2E"

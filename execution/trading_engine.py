@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR
 import hashlib
@@ -12,12 +13,14 @@ from execution.account_connections import (
     account_type_from_trade_mode,
     normalize_account_profile,
 )
+from execution.credential_store import WindowsCredentialStore
 from execution.mt5_connection import mt5_connection
 from execution.operating_mode import (
     OperatingConfig,
     OperatingMode,
     execution_state,
     permission_reasons,
+    read_live_readiness,
     verify_account_identity,
 )
 from execution.trading_store import (
@@ -94,9 +97,32 @@ class TradingEngine:
             if config is None
             else config
         )
-        self.connection_factory = connection_factory or mt5_connection
+        self.connection_factory = (
+            connection_factory or self._active_account_connection
+        )
         self.quote_provider = quote_provider or get_live_price
         self.sleeper = sleeper or time.sleep
+
+    @contextmanager
+    def _active_account_connection(self):
+        profile = self.store.get_active_account_profile()
+        if profile is None or profile["credential_ref"] is None:
+            with mt5_connection():
+                yield
+            return
+
+        password = WindowsCredentialStore().get_password(
+            profile["credential_ref"]
+        )
+        try:
+            with mt5_connection(
+                login=profile["login"],
+                password=password,
+                server=profile["server"],
+            ):
+                yield
+        finally:
+            password = None
 
     def refresh_configuration(self):
         if self._config_from_store:
@@ -227,6 +253,171 @@ class TradingEngine:
         self.store.clear_account_connection()
         self.refresh_configuration()
 
+    def authorize_github_operator(self, login):
+        verified = self.verify_account_connection()
+        return self.store.save_github_authorization(
+            login,
+            verified["login"],
+            verified["server"],
+        )
+
+    @staticmethod
+    def _recent_timestamp(value, max_age_seconds):
+        try:
+            moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return False
+        if moment.tzinfo is None or moment.utcoffset() is None:
+            return False
+        age = (
+            datetime.now(timezone.utc) - moment.astimezone(timezone.utc)
+        ).total_seconds()
+        return 0 <= age <= max_age_seconds
+
+    def _live_preflight(self, *, allow_unactivated):
+        self.refresh_configuration()
+        if self.config.mode != OperatingMode.LIVE:
+            raise TradeRejected("Select LIVE mode before LIVE preflight.")
+        if (
+            self.config.expected_account_type != "LIVE"
+            or self.config.expected_login is None
+            or not self.config.expected_server
+            or not self.config.account_verified
+        ):
+            raise TradeRejected(
+                "A verified LIVE MT5 account profile is required."
+            )
+        if self.config.risk_percent > 0.25:
+            raise TradeRejected("Per-trade LIVE risk cannot exceed 0.25%.")
+
+        manager = self.store.get_account_manager_state()
+        if (
+            manager["github_authorized_login"] != "Silas-AFK"
+            or manager["github_account_login"] != self.config.expected_login
+            or manager["github_account_server"] != self.config.expected_server
+            or not self._recent_timestamp(
+                manager["github_authorized_at"],
+                600,
+            )
+        ):
+            raise TradeRejected(
+                "Fresh GitHub authorization for the verified LIVE account is required."
+            )
+
+        readiness = read_live_readiness(
+            self.config.live_readiness_file,
+            account_login=self.config.expected_login,
+            account_server=self.config.expected_server,
+        )
+        missing = [name for name, passed in readiness.items() if not passed]
+        if missing:
+            raise TradeRejected(
+                "LIVE readiness checks are incomplete: " + ", ".join(missing)
+            )
+
+        heartbeat = self.store.runner_heartbeat()
+        if (
+            not self.config.runner_enabled
+            or not self._recent_timestamp(heartbeat.get("heartbeat_at"), 60)
+            or not heartbeat.get("process_id")
+        ):
+            raise TradeRejected("The LIVE supervisor heartbeat is not healthy.")
+        if not self.config.agent_enabled:
+            raise TradeRejected("Automated signal scanning is disabled.")
+
+        with self.connection_factory():
+            account_check = verify_account_identity(self.api, self.config)
+            if not account_check["verified"]:
+                raise TradeRejected("; ".join(account_check["reasons"]))
+            account = account_check["account"]
+            if (
+                account.get("login") != self.config.expected_login
+                or account.get("server") != self.config.expected_server
+                or account_type_from_trade_mode(
+                    self.api,
+                    account.get("trade_mode"),
+                ) != "LIVE"
+            ):
+                raise TradeRejected(
+                    "The actual MT5 terminal identity is not the verified LIVE account."
+                )
+
+            if not allow_unactivated and (
+                manager["live_activated_at"] is None
+                or manager["live_account_login"] != account["login"]
+                or manager["live_account_server"] != account["server"]
+                or manager["live_risk_policy_hash"]
+                != self.config.risk_policy_hash
+            ):
+                raise TradeRejected(
+                    "A current, account-bound LIVE activation is required."
+                )
+
+            now = datetime.now(timezone.utc).isoformat()
+            candidate = self.config.__class__(
+                **{
+                    **self.config.__dict__,
+                    "execution_enabled": True,
+                    "live_authorized": True,
+                    "live_activated_at": (
+                        manager["live_activated_at"] or now
+                    ),
+                    "live_activated_by": "Silas-AFK",
+                    "live_account_login": account["login"],
+                    "live_account_server": account["server"],
+                    "live_risk_policy_hash": self.config.risk_policy_hash,
+                    "live_risk_acknowledged_at": (
+                        manager["live_risk_acknowledged_at"] or now
+                    ),
+                    "live_real_money_acknowledged_at": (
+                        manager["live_real_money_acknowledged_at"] or now
+                    ),
+                    "live_first_order_authorized_at": (
+                        manager["live_first_order_authorized_at"] or now
+                    ),
+                }
+            )
+            state = execution_state(
+                config=candidate,
+                api=self.api,
+                store=self.store,
+            )
+            if state["reasons"]:
+                raise TradeRejected("; ".join(state["reasons"]))
+        return account
+
+    def activate_live(
+        self,
+        *,
+        real_money_acknowledged,
+        risk_limits_acknowledged,
+    ):
+        if real_money_acknowledged is not True:
+            raise TradeRejected("A separate real-money risk acknowledgement is required.")
+        if risk_limits_acknowledged is not True:
+            raise TradeRejected("Confirm the currently configured risk limits.")
+        account = self._live_preflight(allow_unactivated=True)
+        return self.store.record_live_activation(
+            operator="Silas-AFK",
+            account_login=account["login"],
+            account_server=account["server"],
+            risk_policy_hash=self.config.risk_policy_hash,
+            risk_acknowledged=risk_limits_acknowledged,
+            real_money_acknowledged=real_money_acknowledged,
+        )
+
+    def authorize_first_live_order(self, *, operator_confirmed):
+        if operator_confirmed is not True:
+            raise TradeRejected(
+                "A separate first LIVE order confirmation is required."
+            )
+        account = self._live_preflight(allow_unactivated=False)
+        return self.store.authorize_first_live_order(
+            operator_confirmed=True,
+            account_login=account["login"],
+            account_server=account["server"],
+        )
+
     def _risk_policy(self):
         return RiskPolicy.from_mapping({
             "risk_per_trade_percent": self.config.risk_percent,
@@ -255,7 +446,7 @@ class TradingEngine:
             if self.config.mode == OperatingMode.RESEARCH:
                 raise TradeRejected("Execution cannot be enabled in RESEARCH mode.")
             if self.config.mode == OperatingMode.LIVE:
-                raise TradeRejected("LIVE execution is disabled and unavailable.")
+                self._live_preflight(allow_unactivated=False)
             candidate = self.config
             candidate = candidate.__class__(
                 **{
@@ -1098,41 +1289,141 @@ class TradingEngine:
                     )
                     raise TradeRejected(str(detail))
 
-                result = self.api.order_send(request)
+                try:
+                    result = self.api.order_send(request)
+                except Exception:
+                    result = None
                 done_codes = {
                     getattr(self.api, "TRADE_RETCODE_DONE", -1),
                     getattr(self.api, "TRADE_RETCODE_DONE_PARTIAL", -2),
                 }
+                ticket = (
+                    getattr(result, "order", None)
+                    or getattr(result, "deal", None)
+                    if result is not None
+                    else None
+                )
+                position = None
                 if result is None or getattr(result, "retcode", None) not in done_codes:
-                    detail = (
-                        getattr(result, "comment", "MT5 order was rejected.")
-                        if result is not None
-                        else "MT5 order submission returned no result."
-                    )
-                    self.store.update_trade(
-                        reservation["trade"]["trade_id"],
-                        status="REJECTED",
-                        error=str(detail),
-                    )
-                    self.store.record_event("ERROR", "ORDER_REJECTED", detail)
-                    raise TradeRejected(str(detail))
-
-                ticket = getattr(result, "order", None) or getattr(result, "deal", None)
-                position = self._find_position(symbol, direction, volume, ticket)
+                    try:
+                        position = self._find_position(
+                            symbol,
+                            direction,
+                            volume,
+                            ticket,
+                        )
+                    except Exception:
+                        position = None
+                    if position is not None:
+                        ticket = ticket or position.ticket
+                    elif result is None:
+                        detail = (
+                            "MT5 did not confirm the order outcome. The trade "
+                            "is locked for broker reconciliation; do not retry."
+                        )
+                        self.store.update_trade(
+                            reservation["trade"]["trade_id"],
+                            status="PENDING_CONFIRMATION",
+                            error=detail,
+                        )
+                        self.store.activate_lockout(detail)
+                        self.store.record_event(
+                            "CRITICAL",
+                            "ORDER_OUTCOME_UNCERTAIN",
+                            detail,
+                        )
+                        raise TradeRejected(detail) from None
+                    else:
+                        retcode = getattr(result, "retcode", None)
+                        definite_rejections = {
+                            getattr(self.api, name)
+                            for name in (
+                                "TRADE_RETCODE_REJECT",
+                                "TRADE_RETCODE_CANCEL",
+                                "TRADE_RETCODE_INVALID",
+                                "TRADE_RETCODE_INVALID_VOLUME",
+                                "TRADE_RETCODE_INVALID_PRICE",
+                                "TRADE_RETCODE_INVALID_STOPS",
+                                "TRADE_RETCODE_TRADE_DISABLED",
+                                "TRADE_RETCODE_MARKET_CLOSED",
+                                "TRADE_RETCODE_NO_MONEY",
+                                "TRADE_RETCODE_PRICE_CHANGED",
+                                "TRADE_RETCODE_PRICE_OFF",
+                                "TRADE_RETCODE_INVALID_EXPIRATION",
+                                "TRADE_RETCODE_INVALID_FILL",
+                                "TRADE_RETCODE_ONLY_REAL",
+                                "TRADE_RETCODE_LIMIT_ORDERS",
+                                "TRADE_RETCODE_LIMIT_VOLUME",
+                                "TRADE_RETCODE_INVALID_ORDER",
+                                "TRADE_RETCODE_LIMIT_POSITIONS",
+                            )
+                            if hasattr(self.api, name)
+                        }
+                        detail = getattr(
+                            result,
+                            "comment",
+                            "MT5 did not confirm the order outcome.",
+                        ) or "MT5 did not confirm the order outcome."
+                        if retcode in definite_rejections:
+                            self.store.update_trade(
+                                reservation["trade"]["trade_id"],
+                                status="REJECTED",
+                                error=str(detail),
+                            )
+                            self.store.record_event(
+                                "ERROR",
+                                "ORDER_REJECTED",
+                                str(detail),
+                            )
+                            raise TradeRejected(str(detail))
+                        detail = (
+                            "MT5 returned an ambiguous order outcome. The trade "
+                            "is locked for broker reconciliation; do not retry."
+                        )
+                        self.store.update_trade(
+                            reservation["trade"]["trade_id"],
+                            order_ticket=ticket,
+                            status="PENDING_CONFIRMATION",
+                            error=detail,
+                        )
+                        self.store.activate_lockout(detail)
+                        self.store.record_event(
+                            "CRITICAL",
+                            "ORDER_OUTCOME_UNCERTAIN",
+                            detail,
+                        )
+                        raise TradeRejected(detail)
                 if position is None:
+                    try:
+                        position = self._find_position(
+                            symbol,
+                            direction,
+                            volume,
+                            ticket,
+                        )
+                    except Exception:
+                        position = None
+                if position is None:
+                    detail = (
+                        "Broker acknowledged the order but the position could "
+                        "not be verified. Reconcile before retrying."
+                    )
                     self.store.update_trade(
                         reservation["trade"]["trade_id"],
                         order_ticket=ticket,
                         status="PENDING_CONFIRMATION",
-                        error="Order accepted; position confirmation is pending.",
+                        error=detail,
                     )
-                    self.store.activate_lockout(
-                        "Broker accepted an order but the position could not be verified."
+                    self.store.activate_lockout(detail)
+                    self.store.record_event(
+                        "CRITICAL",
+                        "ORDER_OUTCOME_UNCERTAIN",
+                        detail,
                     )
                     return {
                         "submitted": True,
                         "protected": False,
-                        "reason": "Broker acceptance needs manual reconciliation.",
+                        "reason": detail,
                         "trade": self.store.get_trade(
                             reservation["trade"]["trade_id"]
                         ),
@@ -1313,6 +1604,11 @@ class TradingEngine:
                     status="OPEN",
                     error=None,
                 )
+                if self.config.mode == OperatingMode.LIVE:
+                    self.store.mark_first_live_order_submitted(
+                        int(account_identity["login"]),
+                        account_identity["server"],
+                    )
                 self.store.record_event(
                     "INFO",
                     "ORDER_OPENED",

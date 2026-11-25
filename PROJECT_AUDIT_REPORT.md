@@ -1,4 +1,129 @@
-# NEXORA FX Project Audit — Account Connections
+# NEXORA FX — Current LIVE Implementation Status
+
+**Audit date:** 2026-11-25
+**Scope:** Account & Trading Mode Manager, persistent GitHub operator authorization,
+LIVE permission gates, uncertain MT5 order outcomes, offline tests, and current
+operational limitations.
+
+## Status summary
+
+NEXORA FX supports RESEARCH, DEMO, and LIVE modes. LIVE is no longer
+hard-disabled: the existing order engine can submit through MT5 only after
+the account-bound authorization and execution gates described below pass.
+The dashboard defaults to disarmed execution; implementation and tests did
+not submit any DEMO or LIVE broker order. No claim is made that the actual
+terminal, broker, OAuth app, or Windows Credential Manager was successfully
+verified with the operator's credentials.
+
+### Capability status
+
+| Area | Status |
+|---|---|
+| Account profiles | **Implemented; offline tested.** Multiple persistent profiles, switch, connect, verify, disconnect, and reconnect controls share the SQLite configuration used by the runner. Actual login, server, and DEMO/LIVE type are checked against MT5 responses. Tests use a mock terminal only. |
+| MT5 credential storage | **Implemented; backend selection previously checked.** Account passwords use the Windows Credential Manager `WinVaultKeyring`; no plaintext fallback is allowed. Unit tests use an isolated fake vault. A real user password was not written or tested. |
+| GitHub operator auth | **Implemented; mocked only.** Official OAuth device-flow HTTP requests are implemented; the allowlist is `Silas-AFK`. Only the public client ID and authorization facts persist; device codes/tokens are not written to SQLite or logs. No OAuth App or real sign-in was used. |
+| RESEARCH / DEMO / LIVE | **Implemented.** RESEARCH cannot submit. DEMO and LIVE use the existing order engine. LIVE permission is bound to the verified LIVE account, GitHub authorization, current risk-policy hash, readiness items, supervisor health, baseline/risk gates, explicit real-money/risk acknowledgements, separate first-order authorization, and a distinct execution-arm control. No mode or UI label alone grants permission. |
+| Order execution / position protection | **Offline tested with mocked MT5.** Broker sizing, order checks, fill lookup, attached SL/TP verification, risk limits, duplicate reservation, stop management, break-even, partial close, trailing, and trade-history reconciliation use the existing engine. This is not a broker execution test. |
+| Uncertain order results | **Hardened and offline tested.** A lost response/timeout triggers immediate position lookup; if no fill is verified, a durable pending-confirmation record and emergency lockout prevent retry. Explicit broker rejection is recorded separately. Manual broker reconciliation may still be required when MT5 cannot establish the result. |
+| Supervisor / recovery | **Implemented and unit-tested.** Runner startup disarms scanning/execution and invalidates account verification and GitHub/LIVE permissions; it then reconciles recorded positions. No real process/terminal recovery test was run. |
+| Dashboard | **Offline AppTest passed.** Account Management and LIVE arm/disarm controls render and connect to the backend. Streamlit binds to `127.0.0.1`. No browser-based visual test or live MT5 interaction was performed. |
+| Dependencies | **Installed environment passes `pip check`.** Python 3.12 project dependencies; `keyring` is already listed in `requirements.txt`. |
+| Broker / performance evidence | **Not verified.** No real or demo broker order, fill, stop attachment, or forward test occurred. No profitability claim is made. |
+
+## Validation performed
+
+- Full offline test suite: **109 passed** (all MT5 execution behavior is mocked).
+- Python compilation: **passed** for project Python modules.
+- `pip check`: **No broken requirements found**.
+- `git diff --check`: **passed** before publishing.
+- No real or demo order was submitted.
+- No live MT5 terminal identity, GitHub OAuth sign-in, or password write to
+  Windows Credential Manager was tested.
+- Streamlit AppTest is not a visual browser test; no broker account was used.
+
+## Remaining requirements before any LIVE activation
+
+1. Create a GitHub OAuth App with device flow enabled and enter its public
+   client ID in Account Management. Authenticate as the allowlisted
+   `Silas-AFK` operator while the intended LIVE MT5 profile is connected.
+2. Save the account password through the UI and confirm the Windows Credential
+   Manager backend works for the signed-in Windows user.
+3. Connect and verify the actual LIVE account identity and exact broker server.
+   Do not rely on the profile values alone.
+4. Confirm baseline and supervisor health, then complete each LIVE readiness
+   item only after reviewing real evidence. These records are operator
+   attestations, not independent proof of broker behavior.
+5. Before arming LIVE, independently complete successful DEMO forward testing
+   and verify account identity, sizing, execution, protective stops, daily
+   loss, emergency stop, duplicate prevention, and trade recovery. Those
+   broker-side checks remain **not verified** here.
+6. Review the current risk policy. Explicitly acknowledge real-money risk,
+   activate LIVE, separately authorize the first LIVE order, then use
+   **Execution Safety → Arm LIVE Order Execution**. The execution gate remains
+   disarmed by default and is invalidated on restart, account change, or risk
+   policy change.
+
+LIVE activation controls are implemented, but this report does not recommend
+funding or arming a LIVE account based only on mocked tests. Realized loss can
+exceed configured limits due to gaps, slippage, outages, and rejected closes.
+
+## Files changed in the current implementation
+
+**Created**
+
+- `execution/account_manager.py`
+- `execution/github_device_auth.py`
+- `tests/test_account_manager.py`
+- `tests/test_github_device_auth.py`
+- `tests/test_live_activation.py`
+
+**Modified**
+
+- `README.md`
+- `PROJECT_AUDIT_REPORT.md`
+- `dashboard/dashboard.py`
+- `execution/credential_store.py`
+- `execution/mt5_connection.py`
+- `execution/operating_mode.py`
+- `execution/runner.py`
+- `execution/trading_engine.py`
+- `execution/trading_store.py`
+- `tests/test_account_connections.py`
+- `tests/test_autonomous_trading.py`
+- `tests/test_dashboard_execution_status.py`
+- `tests/test_mt5_connection.py`
+
+No files were deleted. `requirements.txt` already contains
+`keyring>=25,<26` in the current repository baseline.
+
+## Windows launch commands
+
+Dashboard:
+
+```powershell
+Set-Location 'C:\Users\user\Desktop\ForexAI'
+& '.\venv\Scripts\python.exe' -m streamlit run '.\dashboard\dashboard.py' --server.address 127.0.0.1
+```
+
+Supervisor (separate PowerShell window):
+
+```powershell
+Set-Location 'C:\Users\user\Desktop\ForexAI'
+& '.\venv\Scripts\python.exe' -m execution.runner
+```
+
+Offline verification:
+
+```powershell
+Set-Location 'C:\Users\user\Desktop\ForexAI'
+& '.\venv\Scripts\python.exe' -m pytest -q
+& '.\venv\Scripts\python.exe' -m compileall -q core dashboard execution risk tests
+& '.\venv\Scripts\python.exe' -m pip check
+```
+
+---
+
+# Archived Account Connections Audit (superseded)
 
 **Scope:** Persistent MT5 account profiles, account verification, safe switching,
 execution disarming, dashboard behavior, and offline verification.
@@ -103,6 +228,7 @@ backend.
 - `tests/test_dashboard_execution_status.py`
 - `README.md`
 - `PROJECT_AUDIT_REPORT.md`
+- `.streamlit/config.toml`
 
 **Deleted:** none.
 

@@ -22,10 +22,24 @@ def _last_error_text():
 
 
 @contextmanager
-def mt5_connection():
+def mt5_connection(*, login=None, password=None, server=None):
     """Lease an MT5 session without shutting down externally owned sessions."""
 
     global _lease_count, _manager_owns_connection
+
+    if any(value is not None for value in (login, password, server)):
+        if (
+            isinstance(login, bool)
+            or not isinstance(login, int)
+            or login <= 0
+            or not isinstance(password, str)
+            or not password
+            or not isinstance(server, str)
+            or not server.strip()
+        ):
+            raise MT5ConnectionError(
+                "Saved MT5 account credentials are incomplete."
+            )
 
     with _connection_lock:
         try:
@@ -37,16 +51,30 @@ def mt5_connection():
 
         if terminal is None:
             try:
-                initialized = mt5.initialize()
+                if login is None:
+                    initialized = mt5.initialize()
+                else:
+                    initialized = mt5.initialize(
+                        login=login,
+                        password=password,
+                        server=server,
+                    )
             except Exception as error:
+                if login is not None:
+                    raise MT5ConnectionError(
+                        "MT5 initialization failed for the saved account."
+                    ) from None
                 raise MT5ConnectionError(
                     f"MT5 initialization raised an error: {error}"
                 ) from error
 
             if not initialized:
-                raise MT5ConnectionError(
-                    f"MT5 initialization failed: {_last_error_text()}"
+                message = (
+                    "MT5 initialization failed for the saved account."
+                    if login is not None
+                    else f"MT5 initialization failed: {_last_error_text()}"
                 )
+                raise MT5ConnectionError(message)
 
             _manager_owns_connection = True
             try:
@@ -66,9 +94,38 @@ def mt5_connection():
                 finally:
                     _manager_owns_connection = False
                 raise MT5ConnectionError(
-                    "MT5 initialized but terminal information is unavailable: "
+                    "MT5 initialized but terminal information is unavailable."
+                    if login is not None
+                    else "MT5 initialized but terminal information is unavailable: "
                     f"{_last_error_text()}"
                 )
+        elif login is not None:
+            try:
+                account = mt5.account_info()
+            except Exception as error:
+                raise MT5ConnectionError(
+                    "Could not inspect the current MT5 account."
+                ) from error
+            already_selected = (
+                account is not None
+                and getattr(account, "login", None) == login
+                and getattr(account, "server", None) == server
+            )
+            if not already_selected:
+                try:
+                    logged_in = mt5.login(
+                        login,
+                        password=password,
+                        server=server,
+                    )
+                except Exception:
+                    raise MT5ConnectionError(
+                        "Could not authenticate the saved MT5 account."
+                    ) from None
+                if not logged_in:
+                    raise MT5ConnectionError(
+                        "Could not authenticate the saved MT5 account."
+                    )
 
         _lease_count += 1
 

@@ -51,7 +51,8 @@ def scan_cycle(
         ):
             engine.establish_available_baselines()
         for symbol in symbols:
-            analysis = scanner(symbol)
+            with engine.connection_factory():
+                analysis = scanner(symbol)
             if not isinstance(analysis, dict):
                 raise ValueError(
                     f"Signal service returned invalid data for {symbol}."

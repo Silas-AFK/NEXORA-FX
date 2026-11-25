@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
 import json
 import math
 import os
@@ -54,6 +55,18 @@ def _env_percent(name, default, *, maximum=100.0):
     return value
 
 
+def _valid_utc_timestamp(value):
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    return (
+        parsed.tzinfo is not None
+        and parsed.utcoffset() is not None
+        and parsed.astimezone(timezone.utc) <= datetime.now(timezone.utc)
+    )
+
+
 @dataclass(frozen=True)
 class OperatingConfig:
     mode: OperatingMode
@@ -68,6 +81,20 @@ class OperatingConfig:
     live_readiness_file: Path
     expected_account_type: str | None = None
     account_verified: bool = False
+    github_authorized_login: str | None = None
+    github_authorized_at: str | None = None
+    github_account_login: int | None = None
+    github_account_server: str | None = None
+    live_activated_at: str | None = None
+    live_activated_by: str | None = None
+    live_account_login: int | None = None
+    live_account_server: str | None = None
+    live_risk_policy_hash: str | None = None
+    live_risk_acknowledged_at: str | None = None
+    live_real_money_acknowledged_at: str | None = None
+    live_first_order_authorized_at: str | None = None
+    live_first_order_submitted_at: str | None = None
+    risk_policy_hash: str | None = None
     max_weekly_loss_percent: float = 2.0
     max_monthly_loss_percent: float = 4.0
     max_positions_per_symbol: int = 1
@@ -99,6 +126,11 @@ class OperatingConfig:
             ) from error
 
         account_settings = settings.get("account_connection")
+        manager_settings = settings.get("account_manager", {})
+        if not isinstance(manager_settings, dict):
+            raise OperatingModeError(
+                "Stored account manager configuration must be an object."
+            )
         if account_settings is None:
             expected_login = None
             expected_server = None
@@ -191,6 +223,14 @@ class OperatingConfig:
         if mode == OperatingMode.RESEARCH:
             execution_enabled = False
 
+        if settings:
+            live_authorized = bool(
+                manager_settings.get("live_activated_at")
+                and manager_settings.get("live_activated_by") == "Silas-AFK"
+            )
+        else:
+            live_authorized = False
+
         readiness_path = Path(
             os.environ.get(
                 "NEXORA_LIVE_READINESS_FILE",
@@ -205,8 +245,7 @@ class OperatingConfig:
             == "I_UNDERSTAND_DEMO_ORDERS"
             if not settings
             else demo_armed,
-            live_authorized=os.environ.get("NEXORA_LIVE_AUTHORIZATION", "")
-            == "I_EXPLICITLY_AUTHORIZE_LIVE_TRADING",
+            live_authorized=live_authorized,
             risk_percent=risk_policy.risk_per_trade_percent,
             max_daily_loss_percent=risk_policy.max_daily_loss_percent,
             max_aggregate_stop_risk_percent=(
@@ -216,6 +255,37 @@ class OperatingConfig:
             live_readiness_file=readiness_path,
             expected_account_type=expected_account_type,
             account_verified=account_verified,
+            github_authorized_login=manager_settings.get(
+                "github_authorized_login"
+            ),
+            github_authorized_at=manager_settings.get("github_authorized_at"),
+            github_account_login=manager_settings.get("github_account_login"),
+            github_account_server=manager_settings.get("github_account_server"),
+            live_activated_at=manager_settings.get("live_activated_at"),
+            live_activated_by=manager_settings.get("live_activated_by"),
+            live_account_login=manager_settings.get("live_account_login"),
+            live_account_server=manager_settings.get("live_account_server"),
+            live_risk_policy_hash=manager_settings.get(
+                "live_risk_policy_hash"
+            ),
+            live_risk_acknowledged_at=manager_settings.get(
+                "live_risk_acknowledged_at"
+            ),
+            live_real_money_acknowledged_at=manager_settings.get(
+                "live_real_money_acknowledged_at"
+            ),
+            live_first_order_authorized_at=manager_settings.get(
+                "live_first_order_authorized_at"
+            ),
+            live_first_order_submitted_at=manager_settings.get(
+                "live_first_order_submitted_at"
+            ),
+            risk_policy_hash=hashlib.sha256(
+                json.dumps(
+                    risk_policy.to_dict(),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest(),
             max_weekly_loss_percent=risk_policy.max_weekly_loss_percent,
             max_monthly_loss_percent=risk_policy.max_monthly_loss_percent,
             max_positions_per_symbol=risk_policy.max_positions_per_symbol,
@@ -232,7 +302,7 @@ class OperatingConfig:
         )
 
 
-def read_live_readiness(path=None):
+def read_live_readiness_records(path=None):
     readiness_path = Path(path) if path is not None else _LIVE_READINESS_FILE
     try:
         content = json.loads(readiness_path.read_text(encoding="utf-8"))
@@ -242,6 +312,11 @@ def read_live_readiness(path=None):
         content = {}
     if not isinstance(content, dict):
         content = {}
+    return content
+
+
+def read_live_readiness(path=None, *, account_login=None, account_server=None):
+    content = read_live_readiness_records(path)
     readiness = {}
     for item in LIVE_VERIFICATIONS:
         record = content.get(item)
@@ -263,8 +338,96 @@ def read_live_readiness(path=None):
             and parsed_time is not None
             and parsed_time.tzinfo is not None
             and parsed_time <= datetime.now(timezone.utc)
+            and (
+                item != "account_identity_verified"
+                or (
+                    record.get("account_login") == account_login
+                    and record.get("account_server") == account_server
+                    and account_login is not None
+                    and isinstance(account_server, str)
+                    and bool(account_server)
+                )
+            )
         )
     return readiness
+
+
+def save_live_readiness_item(
+    path,
+    item,
+    *,
+    verified,
+    evidence,
+    account_login=None,
+    account_server=None,
+):
+    if item not in LIVE_VERIFICATIONS:
+        raise ValueError("Unknown LIVE readiness requirement.")
+    if not isinstance(verified, bool):
+        raise ValueError("LIVE readiness state must be boolean.")
+    if not isinstance(evidence, str) or len(evidence.strip()) > 500:
+        raise ValueError("Evidence reference must be 1 to 500 characters.")
+    if verified and not evidence.strip():
+        raise ValueError("A reviewed evidence reference is required.")
+    if verified and item == "account_identity_verified" and (
+        isinstance(account_login, bool)
+        or not isinstance(account_login, int)
+        or account_login <= 0
+        or not isinstance(account_server, str)
+        or not account_server.strip()
+    ):
+        raise ValueError(
+            "Verify the current MT5 login and server before recording this check."
+        )
+
+    readiness_path = Path(path)
+    records = {}
+    try:
+        existing = json.loads(readiness_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        existing = {}
+    except (OSError, json.JSONDecodeError) as error:
+        raise OperatingModeError(
+            "LIVE readiness records could not be read safely."
+        ) from error
+    if isinstance(existing, dict):
+        records.update({
+            name: record
+            for name, record in existing.items()
+            if name in LIVE_VERIFICATIONS and isinstance(record, dict)
+        })
+    records[item] = {
+        "verified": verified,
+        "evidence": evidence.strip() if verified else "",
+        "verified_at": (
+            datetime.now(timezone.utc).isoformat() if verified else None
+        ),
+    }
+    if verified and item == "account_identity_verified":
+        records[item]["account_login"] = account_login
+        records[item]["account_server"] = account_server.strip()
+
+    readiness_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = readiness_path.with_name(
+        readiness_path.name + ".tmp"
+    )
+    try:
+        temporary_path.write_text(
+            json.dumps(records, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        temporary_path.replace(readiness_path)
+    except OSError as error:
+        if temporary_path.exists():
+            temporary_path.unlink(missing_ok=True)
+        raise OperatingModeError(
+            "LIVE readiness records could not be saved."
+        ) from error
+    return read_live_readiness(
+        readiness_path,
+        account_login=account_login,
+        account_server=account_server,
+    )
 
 
 def verify_account_identity(api, config, *, require_trading_permissions=True):
@@ -378,13 +541,65 @@ def permission_reasons(config, account_check, emergency_stopped=False):
         if not config.demo_armed:
             reasons.append("Demo order permission has not been explicitly armed.")
     elif config.mode == OperatingMode.LIVE:
-        reasons.append("LIVE execution is disabled and unavailable.")
         if not config.live_authorized:
-            reasons.append("Explicit backend live authorization is absent.")
+            reasons.append("Explicit LIVE activation is absent.")
+        expected_identity = (config.expected_login, config.expected_server)
+        if config.expected_account_type != "LIVE":
+            reasons.append("LIVE mode requires a verified LIVE MT5 account.")
+        if (
+            config.live_activated_by != "Silas-AFK"
+            or (config.live_account_login, config.live_account_server)
+            != expected_identity
+        ):
+            reasons.append(
+                "LIVE activation does not match the authorized operator and account."
+            )
+        if (
+            config.github_authorized_login != "Silas-AFK"
+            or (config.github_account_login, config.github_account_server)
+            != expected_identity
+        ):
+            reasons.append(
+                "A fresh GitHub operator authorization for this account is required."
+            )
+        if (
+            not config.live_risk_acknowledged_at
+            or not config.live_real_money_acknowledged_at
+            or not config.live_risk_policy_hash
+            or config.live_risk_policy_hash != config.risk_policy_hash
+        ):
+            reasons.append(
+                "LIVE risk acknowledgement is missing or the risk policy changed."
+            )
+        if not _valid_utc_timestamp(config.live_activated_at):
+            reasons.append("LIVE activation timestamp is invalid or stale.")
+        if not _valid_utc_timestamp(config.live_risk_acknowledged_at):
+            reasons.append("LIVE risk-limit acknowledgement is invalid.")
+        if not _valid_utc_timestamp(
+            config.live_real_money_acknowledged_at
+        ):
+            reasons.append("LIVE real-money acknowledgement is invalid.")
+        if (
+            config.live_first_order_submitted_at is None
+            and config.live_first_order_authorized_at is None
+        ):
+            reasons.append(
+                "Separate authorization for the first LIVE order is required."
+            )
+        account = account_check.get("account") or {}
+        if (
+            account.get("login") != config.live_account_login
+            or account.get("server") != config.live_account_server
+        ):
+            reasons.append(
+                "The connected LIVE account differs from the activated account."
+            )
         missing = [
             item
             for item, verified in read_live_readiness(
-                config.live_readiness_file
+                config.live_readiness_file,
+                account_login=config.expected_login,
+                account_server=config.expected_server,
             ).items()
             if not verified
         ]
@@ -514,7 +729,11 @@ def execution_state(config=None, api=None, store=None):
         "minimum_reward_risk": config.minimum_reward_risk,
         "session_start_utc": config.session_start_utc,
         "session_end_utc": config.session_end_utc,
-        "live_readiness": read_live_readiness(config.live_readiness_file),
+        "live_readiness": read_live_readiness(
+            config.live_readiness_file,
+            account_login=config.expected_login,
+            account_server=config.expected_server,
+        ),
     }
 
 

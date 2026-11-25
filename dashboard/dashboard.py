@@ -6,17 +6,29 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import sqlite3
 from datetime import datetime, timezone
-import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
+from execution.account_manager import AccountManager
+from execution.credential_store import CredentialStoreError
+from execution.github_device_auth import (
+    GitHubAuthError,
+    poll_device_authorization,
+    start_device_authorization,
+)
 from execution.operating_mode import (
     OperatingModeError,
     execution_state,
     read_live_readiness,
+    read_live_readiness_records,
+    save_live_readiness_item,
 )
-from execution.account_connections import mask_account_login
+from execution.account_connections import (
+    account_type_from_trade_mode,
+    mask_account_login,
+)
 from execution.trading_engine import TradeRejected, TradingEngine
 from execution.trade_analytics import performance_report, utc_period_bounds
 
@@ -190,7 +202,7 @@ page = st.sidebar.radio(
         "Signal Outcome Analysis",
         "Trade History & Performance",
         "Data Quality Monitor",
-        "Account Connections",
+        "Account Management",
         "Execution Safety",
         "System Status",
     ],
@@ -3334,197 +3346,543 @@ elif page == "Data Quality Monitor":
 # EXECUTION SAFETY PAGE
 # ==================================================
 
-elif page == "Account Connections":
+elif page == "Account Management":
 
-    st.subheader("MT5 Account Connections")
+    st.subheader("Account & Trading Mode Manager")
     st.caption(
-        "Save the intended account identity, then verify it against the "
-        "currently connected MetaTrader 5 terminal. This page never stores "
-        "an MT5 password and never submits orders."
+        "Manage multiple MT5 profiles, operating mode, and operator "
+        "authorization. Passwords are stored only in Windows Credential "
+        "Manager. This page never submits an order."
     )
+    if st.session_state.pop("clear_account_password_next_run", False):
+        st.session_state["account_profile_password"] = ""
+    next_profile = st.session_state.pop(
+        "account_profile_select_after_save",
+        None,
+    )
+    if next_profile:
+        st.session_state["account_profile_selection"] = next_profile
+
     try:
         engine = TradingEngine(api=mt5)
-        profile = engine.store.get_account_connection()
+        store = engine.store
+        configuration = store.get_operational_config()
+        profile = store.get_account_connection()
+        profiles = store.list_account_profiles()
+        manager_state = configuration["account_manager"]
     except (OperatingModeError, sqlite3.Error, ValueError) as error:
-        st.error(f"Account connection settings are unavailable: {error}")
+        st.error(f"Account manager configuration is unavailable: {error}")
         st.stop()
 
+    with st.container(border=True):
+        st.markdown("#### Operating mode")
+        st.caption(
+            "Mode changes disarm order execution. LIVE remains locked "
+            "until every backend identity, readiness, risk, and authorization "
+            "gate passes."
+        )
+        with st.form("account_manager_mode_form"):
+            chosen_mode = st.segmented_control(
+                "Choose operating mode",
+                ["RESEARCH", "DEMO", "LIVE"],
+                default=configuration["mode"],
+                key="account_manager_mode",
+            )
+            save_mode = st.form_submit_button(
+                "Save operating mode",
+                type="primary",
+            )
+        if save_mode:
+            try:
+                if chosen_mode not in {"RESEARCH", "DEMO", "LIVE"}:
+                    raise ValueError("Select RESEARCH, DEMO, or LIVE mode.")
+                store.update_operational_config(mode=chosen_mode)
+                st.success(
+                    f"{chosen_mode} mode saved. Execution remains disarmed."
+                )
+                st.rerun()
+            except (ValueError, sqlite3.Error) as error:
+                st.error(f"Operating mode was not changed: {error}")
+
+    st.divider()
+    st.markdown("#### Saved MT5 accounts")
     if profile:
-        profile_columns = st.columns(3)
-        profile_columns[0].metric(
-            "Saved login",
+        status_columns = st.columns(3)
+        status_columns[0].metric(
+            "Active account",
             mask_account_login(profile["login"]),
             border=True,
         )
-        profile_columns[1].metric(
+        status_columns[1].metric(
             "Account type",
             profile["account_type"],
             border=True,
         )
-        profile_columns[2].metric(
+        status_columns[2].metric(
             "Identity verification",
             "VERIFIED" if profile["verified"] else "REQUIRED",
             border=True,
         )
-        st.caption(f"Saved broker server: {profile['server']}")
-        if profile["account_type"] == "LIVE":
-            st.error(
-                "LIVE order execution is disabled and unavailable, even if "
-                "this account profile is verified."
-            )
+        st.caption(f"Broker server: {profile['server']}")
     else:
-        st.warning("No MT5 account profile is saved.")
-
-    st.info(
-        "The profile stores only login, broker server, and account type in "
-        "NEXORA's local trading database. The MetaTrader terminal remains "
-        "responsible for authentication."
-    )
-
-    action_columns = st.columns(3)
-    if action_columns[0].button(
-        "Connect to MT5",
-        key="account_connections_connect",
-        type="primary",
-    ):
-        try:
-            connected = engine.connect_account()
-            st.success(
-                "MT5 terminal is connected. Actual terminal identity: "
-                f"{mask_account_login(connected['login'])} @ "
-                f"{connected['server']} ({connected['account_type']})."
-            )
-            if connected["matches_saved_profile"] is False:
-                st.error(
-                    "The terminal identity does not match the saved profile. "
-                    "Verification was invalidated and execution disarmed."
-                )
-            elif connected["matches_saved_profile"] is None:
-                st.info(
-                    "Save the intended profile and use Verify before any "
-                    "execution eligibility can be considered."
-                )
-            if not connected["terminal_trade_allowed"]:
-                st.warning("MT5 terminal trading permission is not enabled.")
-            if not connected["account_trade_allowed"]:
-                st.warning("The connected account does not permit expert trading.")
-        except (MT5ConnectionError, TradeRejected, ValueError, sqlite3.Error) as error:
-            st.error(f"MT5 connection check failed: {error}")
-
-    if action_columns[1].button(
-        "Verify Saved Account",
-        key="account_connections_verify",
-        disabled=profile is None,
-    ):
-        try:
-            verified = engine.verify_account_connection()
-            st.success(
-                "Saved account identity verified against the connected MT5 "
-                f"terminal: {mask_account_login(verified['login'])} @ "
-                f"{verified['server']} ({verified['account_type']})."
+        st.info("No MT5 account is active in NEXORA.")
+    try:
+        with mt5_connection():
+            terminal = mt5.terminal_info()
+            actual_account = mt5.account_info()
+        if (
+            terminal is not None
+            and getattr(terminal, "connected", None) is True
+            and actual_account is not None
+        ):
+            actual_type = account_type_from_trade_mode(
+                mt5,
+                getattr(actual_account, "trade_mode", None),
             )
             st.caption(
-                "This verifies identity only. It does not arm execution or "
-                "override terminal trading permissions, risk controls, "
-                "supervisor checks, or operator confirmation."
+                "Actual connected MT5 identity: "
+                f"{mask_account_login(actual_account.login)} @ "
+                f"{actual_account.server} "
+                f"({actual_type or 'unknown account type'})."
             )
-        except (MT5ConnectionError, TradeRejected, ValueError, sqlite3.Error) as error:
-            st.error(f"Account verification failed: {error}")
+        else:
+            st.caption("Actual connected MT5 identity: unavailable.")
+    except MT5ConnectionError:
+        st.caption("Actual connected MT5 identity: MT5 terminal unavailable.")
 
-    if action_columns[2].button(
-        "Disconnect Saved Account",
-        key="account_connections_disconnect",
+    if profiles:
+        labels = {
+            item["profile_id"]: (
+                f"{mask_account_login(item['login'])} | {item['server']} | "
+                f"{item['account_type']}"
+            )
+            for item in profiles
+        }
+        ids = list(labels)
+        active_id = manager_state["active_profile_id"]
+        selected_id = st.selectbox(
+            "Saved account profiles",
+            options=ids,
+            index=ids.index(active_id) if active_id in ids else 0,
+            format_func=lambda value: labels[value],
+            key="account_profile_selection",
+        )
+        selected_profile = store.get_account_profile(selected_id)
+        profile_actions = st.columns(3)
+        if profile_actions[0].button(
+            "Switch Account",
+            key="switch_saved_account",
+            disabled=selected_id == active_id,
+        ):
+            try:
+                AccountManager(store).activate_profile(selected_id)
+                engine.refresh_configuration()
+                st.success(
+                    "Active account changed. Scanning, execution, and the "
+                    "supervisor were disarmed; connect and verify this profile."
+                )
+                st.rerun()
+            except (ValueError, sqlite3.Error, CredentialStoreError) as error:
+                st.error(f"Account switch failed: {error}")
+        if profile_actions[1].button(
+            "Connect selected account",
+            key="connect_saved_account",
+            type="primary",
+        ):
+            try:
+                connected = AccountManager(store).connect_profile(
+                    selected_id,
+                    engine,
+                )
+                st.success(
+                    "MT5 account connected and verified: "
+                    f"{mask_account_login(connected['login'])} @ "
+                    f"{connected['server']} ({connected['account_type']})."
+                )
+            except (
+                CredentialStoreError,
+                MT5ConnectionError,
+                TradeRejected,
+                ValueError,
+                sqlite3.Error,
+            ) as error:
+                st.error(f"Could not connect the selected profile: {error}")
+        if profile_actions[2].button(
+            "Verify active account",
+            key="verify_saved_account",
+            disabled=selected_id != active_id,
+        ):
+            try:
+                verified = engine.verify_account_connection()
+                st.success(
+                    "Actual MT5 identity verified: "
+                    f"{mask_account_login(verified['login'])} @ "
+                    f"{verified['server']} ({verified['account_type']})."
+                )
+            except (
+                CredentialStoreError,
+                MT5ConnectionError,
+                TradeRejected,
+                ValueError,
+                sqlite3.Error,
+            ) as error:
+                st.error(f"Account verification failed: {error}")
+        if selected_profile:
+            credential_status = (
+                "secure credential reference saved"
+                if selected_profile["credential_ref"]
+                else "password must be saved"
+            )
+            st.caption(
+                f"Selected profile: {credential_status}. Passwords are never "
+                "shown again after saving."
+            )
+    else:
+        st.info("Save your first MT5 account profile below.")
+
+    disconnect_columns = st.columns([1, 3])
+    if disconnect_columns[0].button(
+        "Disconnect from NEXORA",
+        key="disconnect_active_account",
         disabled=profile is None,
     ):
         try:
-            engine.disconnect_account()
+            AccountManager(store).disconnect(engine)
             st.success(
-                "Saved account profile cleared and execution disarmed. "
-                "The MetaTrader terminal itself was not shut down."
+                "NEXORA disarmed and disconnected the saved profile. The "
+                "MT5 desktop terminal was not shut down; the saved profile "
+                "and its secure credential remain available for reconnecting."
             )
             st.rerun()
-        except (TradeRejected, ValueError, sqlite3.Error) as error:
+        except (ValueError, sqlite3.Error) as error:
             st.error(f"Account disconnect failed: {error}")
 
-    st.divider()
-    st.subheader("Save or Switch Account Profile")
-    with st.form("account_connection_profile_form"):
-        account_login = st.text_input(
-            "MT5 account login",
-            value=str(profile["login"]) if profile else "",
-            help="Digits only. This must match the identity reported by MT5.",
-            key="account_profile_login",
-        )
-        broker_server = st.text_input(
-            "Broker server",
-            value=profile["server"] if profile else "",
-            help="Use the exact server name reported by the MT5 terminal.",
-            key="account_profile_server",
-        )
-        account_type = st.selectbox(
-            "Account type",
-            ["DEMO", "LIVE"],
-            index=(
-                ["DEMO", "LIVE"].index(profile["account_type"])
-                if profile
-                else 0
-            ),
-            key="account_profile_type",
-        )
-        switch_confirmed = st.checkbox(
-            "I understand that switching immediately disarms execution and "
-            "requires fresh account verification.",
-            key="confirm_account_switch",
-            disabled=profile is None,
-        )
-        save_profile = st.form_submit_button(
-            "Save Account Profile",
-            type="primary",
-            key="save_account_profile",
-        )
-        switch_profile = st.form_submit_button(
-            "Switch Account",
-            disabled=profile is None or not switch_confirmed,
-            key="switch_account_profile",
-        )
+    with st.expander("Add an account or update its saved password"):
+        with st.form("account_profile_save_form"):
+            account_login = st.text_input(
+                "MT5 account login",
+                help="Digits only; checked against the actual MT5 identity.",
+                key="account_profile_login",
+            )
+            broker_server = st.text_input(
+                "Broker server",
+                help="Use the exact server name reported by MT5.",
+                key="account_profile_server",
+            )
+            account_type = st.selectbox(
+                "Account type",
+                ["DEMO", "LIVE"],
+                key="account_profile_type",
+            )
+            account_password = st.text_input(
+                "MT5 password",
+                type="password",
+                help="Saved only in Windows Credential Manager; never logged.",
+                key="account_profile_password",
+            )
+            save_profile = st.form_submit_button(
+                "Save account securely",
+                type="primary",
+                key="save_account_profile",
+            )
+        if save_profile:
+            try:
+                saved = AccountManager(store).save_profile(
+                    account_login,
+                    broker_server,
+                    account_type,
+                    account_password,
+                )
+                st.session_state["account_profile_select_after_save"] = (
+                    saved["profile_id"]
+                )
+                st.session_state["clear_account_password_next_run"] = True
+                st.success(
+                    "Account profile and password saved securely. Select "
+                    "Switch Account, then Connect selected account."
+                )
+                st.rerun()
+            except (
+                CredentialStoreError,
+                ValueError,
+                sqlite3.Error,
+            ) as error:
+                st.session_state["clear_account_password_next_run"] = True
+                st.error(f"Account profile was not saved: {error}")
 
-    if save_profile or switch_profile:
+    st.caption(
+        "Changing or switching accounts invalidates prior verification and "
+        "disarms the runner and execution. Account changes are blocked while "
+        "managed trades require reconciliation. Disconnect does not log the "
+        "MT5 desktop terminal out."
+    )
+
+    st.divider()
+    st.markdown("#### GitHub operator verification")
+    st.caption(
+        "Authenticate with the official GitHub device flow as "
+        "**Silas-AFK**. Only the public OAuth client ID is saved. The device "
+        "code and access token are transient; the access token is discarded "
+        "after the username is checked."
+    )
+    with st.form("github_client_id_form"):
+        github_client_id = st.text_input(
+            "Public GitHub OAuth client ID",
+            value=manager_state["github_client_id"] or "",
+            help="Create an OAuth App with device flow enabled. Do not enter a client secret.",
+            key="github_oauth_client_id",
+        )
+        save_client_id = st.form_submit_button("Save public client ID")
+    if save_client_id:
         try:
-            if switch_profile:
-                engine.switch_account_connection(
-                    account_login,
-                    broker_server,
-                    account_type,
+            store.save_github_client_id(github_client_id)
+            st.success("Public GitHub client ID saved.")
+            st.rerun()
+        except (ValueError, sqlite3.Error) as error:
+            st.error(f"GitHub client ID was not saved: {error}")
+
+    if manager_state["github_client_id"]:
+        device_flow = st.session_state.get("github_device_flow")
+        if st.button(
+            "Start GitHub sign-in",
+            key="start_github_signin",
+            disabled=not profile or not profile["verified"],
+        ):
+            try:
+                device_flow = start_device_authorization(
+                    manager_state["github_client_id"]
                 )
-                st.success(
-                    "Account profile switched. Execution, signal scanning, "
-                    "and the runner were disarmed; verify the new terminal "
-                    "identity before proceeding."
-                )
+                device_flow["client_id"] = manager_state["github_client_id"]
+                device_flow["next_poll_at"] = 0.0
+                st.session_state["github_device_flow"] = device_flow
+            except (GitHubAuthError, ValueError) as error:
+                st.error(f"GitHub sign-in could not start: {error}")
+        device_flow = st.session_state.get("github_device_flow")
+        if device_flow:
+            if time.time() >= device_flow["expires_at"]:
+                st.session_state.pop("github_device_flow", None)
+                st.warning("GitHub device code expired; start sign-in again.")
             else:
-                engine.save_account_connection(
-                    account_login,
-                    broker_server,
-                    account_type,
+                st.link_button(
+                    "Open GitHub device authorization",
+                    device_flow["verification_uri"],
                 )
-                st.success(
-                    "Account profile saved. Verify it against the connected "
-                    "MT5 terminal before proceeding."
+                st.code(device_flow["user_code"])
+                poll_wait = max(0.0, device_flow["next_poll_at"] - time.time())
+                if st.button(
+                    "Check GitHub authorization",
+                    key="poll_github_signin",
+                    disabled=poll_wait > 0,
+                ):
+                    try:
+                        result = poll_device_authorization(
+                            device_flow["client_id"],
+                            device_flow["device_code"],
+                        )
+                        if result["status"] in {
+                            "authorization_pending",
+                            "slow_down",
+                        }:
+                            if result["status"] == "slow_down":
+                                device_flow["interval"] += 5
+                            device_flow["next_poll_at"] = (
+                                time.time() + device_flow["interval"]
+                            )
+                            st.info(
+                                "GitHub authorization is still pending. "
+                                "Approve the request, then check again."
+                            )
+                        elif result["status"] == "authorized":
+                            if result["login"].casefold() != "silas-afk":
+                                store.clear_github_authorization()
+                                st.session_state.pop(
+                                    "github_device_flow",
+                                    None,
+                                )
+                                st.error(
+                                    "The authenticated GitHub account is not "
+                                    "allowlisted for LIVE activation."
+                                )
+                            else:
+                                engine.authorize_github_operator(
+                                    result["login"]
+                                )
+                                st.session_state.pop(
+                                    "github_device_flow",
+                                    None,
+                                )
+                                st.success(
+                                    "GitHub operator verified for the active "
+                                    "MT5 account. This does not arm execution."
+                                )
+                                st.rerun()
+                        else:
+                            st.session_state.pop("github_device_flow", None)
+                            st.error(
+                                "GitHub authorization was denied or expired."
+                            )
+                    except (
+                        GitHubAuthError,
+                        CredentialStoreError,
+                        MT5ConnectionError,
+                        TradeRejected,
+                        ValueError,
+                        sqlite3.Error,
+                    ) as error:
+                        st.error(f"GitHub verification failed: {error}")
+
+    operator_status = (
+        "verified"
+        if manager_state["github_authorized_login"] == "Silas-AFK"
+        else "not verified"
+    )
+    st.caption(f"GitHub operator status: {operator_status}.")
+    st.caption(
+        "LIVE activation: "
+        f"{'recorded' if manager_state['live_activated_at'] else 'not active'}; "
+        "first-order authorization: "
+        f"{'recorded' if manager_state['live_first_order_authorized_at'] else 'not recorded'}."
+    )
+
+    st.divider()
+    st.markdown("#### LIVE eligibility and readiness evidence")
+    st.warning(
+        "LIVE activation can expose real money to loss. Readiness entries "
+        "are operator attestations, not independently tested facts. Do not "
+        "mark any item verified without reviewed evidence. No order is sent "
+        "by this page."
+    )
+    live_profile = store.get_account_connection()
+    readiness_identity = (
+        {
+            "account_login": live_profile["login"],
+            "account_server": live_profile["server"],
+        }
+        if live_profile and live_profile["verified"]
+        else {}
+    )
+    readiness = read_live_readiness(
+        engine.config.live_readiness_file,
+        account_login=readiness_identity.get("account_login"),
+        account_server=readiness_identity.get("account_server"),
+    )
+    readiness_records = read_live_readiness_records(
+        engine.config.live_readiness_file
+    )
+    for requirement in readiness:
+        previous = readiness_records.get(requirement, {})
+        with st.form(f"live_readiness_form_{requirement}"):
+            st.write(requirement.replace("_", " ").capitalize())
+            confirmed = st.checkbox(
+                "Evidence reviewed and requirement passed",
+                value=previous.get("verified") is True,
+                key=f"live_readiness_{requirement}",
+            )
+            evidence = st.text_input(
+                "Evidence reference (never enter secrets)",
+                value="",
+                key=f"live_evidence_{requirement}",
+            )
+            save_evidence = st.form_submit_button("Save evidence")
+        if save_evidence:
+            try:
+                account_login = None
+                account_server = None
+                if requirement == "account_identity_verified" and confirmed:
+                    verified_account = engine.verify_account_connection()
+                    if verified_account["account_type"] != "LIVE":
+                        raise TradeRejected(
+                            "This readiness item requires an actual LIVE account."
+                        )
+                    account_login = verified_account["login"]
+                    account_server = verified_account["server"]
+                save_live_readiness_item(
+                    engine.config.live_readiness_file,
+                    requirement,
+                    verified=confirmed,
+                    evidence=evidence,
+                    account_login=account_login,
+                    account_server=account_server,
                 )
+                st.success("Readiness record updated.")
+                st.rerun()
+            except (
+                OperatingModeError,
+                CredentialStoreError,
+                MT5ConnectionError,
+                TradeRejected,
+                ValueError,
+                sqlite3.Error,
+            ) as error:
+                st.error(f"Readiness record was not saved: {error}")
+        st.caption("Verified" if readiness[requirement] else "Not verified")
+
+    current_policy = configuration["risk_policy"]
+    st.write(
+        "Configured risk: "
+        f"{current_policy['risk_per_trade_percent']:.2f}% per trade, "
+        f"{current_policy['max_daily_loss_percent']:.2f}% daily loss, "
+        f"{current_policy['max_total_open_risk_percent']:.2f}% aggregate "
+        "open risk."
+    )
+    real_money_ack = st.checkbox(
+        "I understand LIVE trading can lose real money.",
+        key="live_real_money_ack",
+    )
+    risk_limits_ack = st.checkbox(
+        "I reviewed and accept the risk limits shown above.",
+        key="live_risk_limits_ack",
+    )
+    if st.button(
+        "Activate LIVE mode",
+        type="primary",
+        key="activate_live_mode",
+        disabled=not (real_money_ack and risk_limits_ack),
+    ):
+        try:
+            engine.activate_live(
+                real_money_acknowledged=real_money_ack,
+                risk_limits_acknowledged=risk_limits_ack,
+            )
+            st.success(
+                "LIVE activation recorded. Execution remains disarmed; the "
+                "first-order authorization and execution arming are separate."
+            )
             st.rerun()
         except (
+            CredentialStoreError,
             MT5ConnectionError,
             TradeRejected,
             ValueError,
             sqlite3.Error,
         ) as error:
-            st.error(f"Account profile was not changed: {error}")
+            st.error(f"LIVE activation was denied: {error}")
 
-    st.caption(
-        "Account changes are blocked while managed trades need reconciliation. "
-        "Disconnect clears NEXORA's saved identity but does not shut down an "
-        "MT5 terminal owned by another application."
+    first_order_ack = st.checkbox(
+        "I separately authorize the first LIVE order after reviewing its plan.",
+        key="live_first_order_ack",
     )
+    if st.button(
+        "Authorize first LIVE order",
+        key="authorize_first_live_order",
+        disabled=not first_order_ack,
+    ):
+        try:
+            engine.authorize_first_live_order(
+                operator_confirmed=first_order_ack,
+            )
+            st.success(
+                "First LIVE order authorization recorded. No order was submitted."
+            )
+            st.rerun()
+        except (
+            CredentialStoreError,
+            MT5ConnectionError,
+            TradeRejected,
+            ValueError,
+            sqlite3.Error,
+        ) as error:
+            st.error(f"First-order authorization was denied: {error}")
 
 
 # ==================================================
@@ -3580,13 +3938,8 @@ elif page == "Execution Safety":
     )
     stored_config = engine.store.get_operational_config()
     stored_policy = stored_config["risk_policy"]
-    with st.form("operating_mode_and_risk_policy"):
-        selected_mode = st.selectbox(
-            "Operating mode",
-            ["RESEARCH", "DEMO", "LIVE"],
-            index=["RESEARCH", "DEMO", "LIVE"].index(state["mode"]),
-            help="Changing mode disarms execution and is blocked while trades need reconciliation.",
-        )
+    st.caption("Select operating mode in Account Management. Mode changes disarm execution.")
+    with st.form("operating_risk_policy"):
         policy_columns = st.columns(3)
         risk_per_trade = policy_columns[0].number_input(
             "Risk per trade (%)",
@@ -3683,7 +4036,7 @@ elif page == "Execution Safety":
             value=stored_policy["session_end_utc"] or "",
         )
         save_policy = st.form_submit_button(
-            "Save Mode and Risk Limits",
+            "Save Risk Limits",
             type="primary",
         )
     if save_policy:
@@ -3705,12 +4058,11 @@ elif page == "Execution Safety":
         }
         try:
             engine.store.update_operational_config(
-                mode=selected_mode,
                 risk_policy=policy,
             )
             st.success(
-                "Mode and risk policy saved. Any previous execution permission "
-                "was disarmed."
+                "Risk policy saved. Any previous execution permission and "
+                "LIVE activation were invalidated."
             )
             st.rerun()
         except (ValueError, sqlite3.Error) as error:
@@ -3726,7 +4078,7 @@ elif page == "Execution Safety":
             f"{'current' if saved_account['verified'] else 'required'}."
         )
     else:
-        st.info("Save and verify an account profile in Account Connections.")
+        st.info("Save and verify an account profile in Account Management.")
     if state["reasons"]:
         st.warning("Entry permission is locked:")
         for reason in state["reasons"]:
@@ -3845,10 +4197,51 @@ elif page == "Execution Safety":
                 ) as error:
                     st.error(f"DEMO execution remains locked: {error}")
     elif state["mode"] == "LIVE":
-        st.error(
-            "LIVE order execution is intentionally unavailable in this "
-            "dashboard session. No LIVE authorization was granted."
+        st.warning(
+            "LIVE mode can submit real-money orders only after account-bound "
+            "operator authorization, readiness evidence, fresh risk checks, "
+            "and the separate first-order confirmation in Account Management."
         )
+        if state["execution_enabled"]:
+            if st.button(
+                "Disarm LIVE Order Execution",
+                type="primary",
+                key="disable_live_execution",
+            ):
+                engine.disable_execution(
+                    "LIVE execution disarmed from the dashboard."
+                )
+                st.success("LIVE order execution is disarmed.")
+                st.rerun()
+        else:
+            with st.form("arm_live_execution_form"):
+                confirmed_live = st.checkbox(
+                    "I verified that MT5 is connected to my intended LIVE "
+                    "account and explicitly authorize autonomous LIVE order "
+                    "submission under the displayed risk limits.",
+                    key="confirm_live_execution",
+                )
+                arm_live = st.form_submit_button(
+                    "Arm LIVE Order Execution",
+                    type="primary",
+                    disabled=not confirmed_live,
+                )
+            if arm_live:
+                try:
+                    engine.enable_execution(operator_confirmed=True)
+                    st.success(
+                        "LIVE execution is armed. No order has been submitted "
+                        "by this action."
+                    )
+                    st.rerun()
+                except (
+                    MT5ConnectionError,
+                    TradeRejected,
+                    OperatingModeError,
+                    ValueError,
+                    sqlite3.Error,
+                ) as error:
+                    st.error(f"LIVE execution remains locked: {error}")
     else:
         st.info(
             "RESEARCH mode is signals-only. Select DEMO mode and complete "
@@ -3902,7 +4295,11 @@ elif page == "Execution Safety":
 
     st.divider()
     st.subheader("LIVE Readiness")
-    readiness = read_live_readiness(engine.config.live_readiness_file)
+    readiness = read_live_readiness(
+        engine.config.live_readiness_file,
+        account_login=engine.config.expected_login,
+        account_server=engine.config.expected_server,
+    )
     for requirement, verified in readiness.items():
         st.write(
             f"{'✅' if verified else '⛔'} "
@@ -3910,8 +4307,10 @@ elif page == "Execution Safety":
             f"{'verified' if verified else 'not verified'}"
         )
     st.info(
-        "LIVE order execution is hard-disabled in the backend. Readiness "
-        "records are informational only and cannot enable LIVE trading."
+        "LIVE entries require account-bound GitHub authorization, reviewed "
+        "readiness evidence, healthy supervision, account-bound baselines, "
+        "risk checks, separate activation and first-order authorization. "
+        "Execution is currently disarmed."
     )
 
     heartbeat = engine.store.runner_heartbeat()

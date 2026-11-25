@@ -73,3 +73,13 @@ class WindowsCredentialStore:
                 "No saved MT5 password exists for this account; update the profile."
             )
         return password
+
+    def delete_password(self, profile_id):
+        self._validate(profile_id)
+        try:
+            self.backend.delete_password(_SERVICE_NAME, profile_id)
+        except Exception as error:
+            if error.__class__.__name__ != "PasswordDeleteError":
+                raise CredentialStoreError(
+                    "Windows Credential Manager could not remove the MT5 password."
+                ) from error

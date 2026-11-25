@@ -134,3 +134,112 @@ def test_missing_terminal_info_after_init_closes_owned_connection(monkeypatch):
             pass
 
     assert shutdown_calls == [True]
+
+
+def test_saved_account_credentials_are_used_without_exposing_password(monkeypatch):
+    state = {"initialized": False}
+    calls = []
+
+    def terminal_info():
+        return SimpleNamespace(connected=True) if state["initialized"] else None
+
+    def initialize(**kwargs):
+        calls.append(kwargs)
+        state["initialized"] = True
+        return True
+
+    def shutdown():
+        state["initialized"] = False
+
+    monkeypatch.setattr(connection_manager.mt5, "terminal_info", terminal_info)
+    monkeypatch.setattr(connection_manager.mt5, "initialize", initialize)
+    monkeypatch.setattr(connection_manager.mt5, "shutdown", shutdown)
+
+    with connection_manager.mt5_connection(
+        login=123456,
+        password="do-not-log-this",
+        server="Broker-Demo",
+    ):
+        assert state["initialized"] is True
+
+    assert calls == [{
+        "login": 123456,
+        "password": "do-not-log-this",
+        "server": "Broker-Demo",
+    }]
+    assert state["initialized"] is False
+
+
+def test_saved_account_login_switches_borrowed_terminal_but_never_shuts_it_down(
+    monkeypatch,
+):
+    calls = {"login": [], "shutdown": []}
+    monkeypatch.setattr(
+        connection_manager.mt5,
+        "terminal_info",
+        lambda: SimpleNamespace(connected=True),
+    )
+    monkeypatch.setattr(
+        connection_manager.mt5,
+        "account_info",
+        lambda: SimpleNamespace(login=999999, server="Other"),
+    )
+    monkeypatch.setattr(
+        connection_manager.mt5,
+        "login",
+        lambda account, *, password, server: calls["login"].append(
+            (account, password, server)
+        ) or True,
+    )
+    monkeypatch.setattr(
+        connection_manager.mt5,
+        "shutdown",
+        lambda: calls["shutdown"].append(True),
+    )
+
+    with connection_manager.mt5_connection(
+        login=123456,
+        password="private",
+        server="Broker-Demo",
+    ):
+        assert connection_manager._manager_owns_connection is False
+
+    assert calls == {
+        "login": [(123456, "private", "Broker-Demo")],
+        "shutdown": [],
+    }
+
+
+def test_credential_login_failure_is_sanitized_and_preserves_borrowed_terminal(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        connection_manager.mt5,
+        "terminal_info",
+        lambda: SimpleNamespace(connected=True),
+    )
+    monkeypatch.setattr(
+        connection_manager.mt5,
+        "account_info",
+        lambda: SimpleNamespace(login=999999, server="Other"),
+    )
+    monkeypatch.setattr(
+        connection_manager.mt5,
+        "login",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("private password value")
+        ),
+    )
+
+    with pytest.raises(
+        connection_manager.MT5ConnectionError,
+        match="Could not authenticate",
+    ) as error:
+        with connection_manager.mt5_connection(
+            login=123456,
+            password="private",
+            server="Broker-Demo",
+        ):
+            pass
+
+    assert "private" not in str(error.value)

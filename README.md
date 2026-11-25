@@ -15,9 +15,13 @@ available as a signals-only fallback.
   Execution remains disarmed by default.
 - **RESEARCH:** analyzes and persists signals when the agent is enabled; it
   never submits orders and remains available as a fallback.
-- **LIVE:** order execution is hard-disabled in the backend and cannot be
-  enabled from the dashboard, configuration file, or environment. Readiness
-  records are informational only. No live order has been submitted.
+- **LIVE:** available in the dashboard but locked behind verified LIVE account
+  identity, allowlisted GitHub device-flow authentication, account-bound
+  readiness evidence, healthy supervision, account-bound risk baselines,
+  explicit real-money/risk acknowledgements, a separate first-order
+  authorization, and the normal execution permission gate. Account, mode,
+  risk-policy, and restart changes invalidate the relevant authorization.
+  No live order has been submitted or tested against a broker.
 
 The dashboard can request a mode or DEMO permission change, but cannot bypass
 backend checks. The supervisor reloads persistent settings and validates the
@@ -67,10 +71,13 @@ has been performed as part of this implementation.
 
 - Windows 10/11
 - Python 3.12
-- MetaTrader 5 desktop terminal installed and logged into an account for live
-  market-data features. DEMO mode can submit orders automatically when every
-  backend gate is satisfied; keep it disarmed except during deliberate demo
-  testing. LIVE order execution is hard-disabled in the backend.
+- MetaTrader 5 desktop terminal installed for broker data and account
+  connection. MT5 credentials are stored in Windows Credential Manager.
+- A GitHub OAuth App with device flow enabled is needed only for operator
+  identity verification; the dashboard accepts its public client ID and does
+  not require a client secret.
+- DEMO/LIVE orders remain subject to backend permission gates. Keep execution
+  disarmed except during deliberate, controlled testing.
 
 Install from PowerShell in the project directory:
 
@@ -89,10 +96,11 @@ From PowerShell:
 
 ```powershell
 Set-Location 'C:\Users\user\Desktop\ForexAI'
-& '.\venv\Scripts\python.exe' -m streamlit run '.\dashboard\dashboard.py'
+& '.\venv\Scripts\python.exe' -m streamlit run '.\dashboard\dashboard.py' --server.address 127.0.0.1
 ```
 
-Open the local URL printed by Streamlit, normally `http://localhost:8501`.
+The dashboard binds to `127.0.0.1` only. Open the local URL printed by
+Streamlit, normally `http://localhost:8501`.
 
 ## Start the autonomous scanner/supervisor
 
@@ -111,15 +119,25 @@ enabled; set `NEXORA_SCAN_INTERVAL_SECONDS` to adjust the interval. A safe
 stop disarms new scans and entries; existing managed positions continue to be
 supervised until reconciled.
 
-Configure account identity in the dashboard's **Account Connections** page;
-the profile is stored in the shared local `data\trading.sqlite3` database and
-contains only the login, broker server, and DEMO/LIVE type. It does not store
-an MT5 password. Use **Connect to MT5**, then **Save Account Profile**, then
-**Verify Saved Account**. NEXORA compares the profile with the identity
-reported by the connected terminal; typing an identity alone never verifies it.
-Saving a new profile, switching, or disconnecting disarms the runner, signal
-scanning, and execution, and requires fresh verification. It does not close
-the MT5 desktop terminal.
+Manage profiles in **Account Management**. Login, broker server, account type,
+and a credential reference are stored in the shared local
+`data\trading.sqlite3`; the MT5 password itself is stored only in Windows
+Credential Manager. Save each account with its password, select **Switch
+Account**, then **Connect selected account**. NEXORA logs into the selected
+account through MT5 and verifies the actual terminal login, server, and
+DEMO/LIVE type. User-entered values alone never verify identity. **Verify
+active account** rechecks the terminal. Multiple profiles persist across
+restarts. Switching or disconnecting disarms scanning/execution and invalidates
+account-bound authorization; the MT5 desktop terminal is not shut down. A
+saved profile can be reconnected through **Connect selected account**.
+
+The same page selects RESEARCH, DEMO, or LIVE. Changing mode disarms execution.
+For GitHub operator verification, create an OAuth App with device flow
+enabled, save its public client ID, then start sign-in and approve the displayed
+device code at GitHub. Authentication is restricted to `Silas-AFK`; the
+short-lived device code is held in Streamlit session memory, and the access
+token is used only to fetch the GitHub username and is not stored. Do not enter
+a GitHub client secret or any secret into an evidence-reference field.
 
 For deliberate DEMO operation, ensure the terminal is connected to the intended
 DEMO account and terminal trading permissions are enabled. Select DEMO mode,
@@ -131,24 +149,24 @@ to a LIVE account. No real or demo order is submitted by account-profile
 management or its automated tests.
 
 To restore safe signals-only behavior, select RESEARCH mode, pause the agent,
-disable DEMO execution, and safely stop the supervisor. LIVE execution remains
-blocked in all modes by the backend, irrespective of readiness records or
-environment values.
+disable execution, and safely stop the supervisor.
 
 ### Live readiness file
 
-The default path is `config\live_readiness.json`; it is intentionally not
-created or marked ready. Every key below must contain a verified flag,
-non-empty evidence reference, and timezone-aware ISO timestamp. Entries are
-operator attestations and must only be written after the corresponding tests
-have actually passed:
+The default path is `config\live_readiness.json`; it is not created or marked
+ready until an operator records evidence in Account Management. Account
+identity evidence is bound to the verified LIVE login/server. Other entries
+are operator attestations, not independent technical verification; only mark
+them after the corresponding checks have actually passed:
 
 ```json
 {
   "account_identity_verified": {
     "verified": true,
     "evidence": "reference to reviewed account/server verification",
-    "verified_at": "2026-01-01T00:00:00+00:00"
+    "verified_at": "2026-01-01T00:00:00+00:00",
+    "account_login": 123456,
+    "account_server": "Broker-Live"
   },
   "order_execution_verified": {},
   "stop_loss_verified": {},
@@ -160,9 +178,12 @@ have actually passed:
 }
 ```
 
-The example is intentionally incomplete and does not enable LIVE. LIVE order
-execution remains hard-disabled even if every readiness record is filled in.
-Do not commit account credentials, authorization values, or readiness evidence.
+Readiness alone does not activate LIVE. The backend additionally requires
+current account identity, an authorized GitHub identity, current risk policy,
+healthy runner and risk baselines, explicit activation acknowledgements, and
+separate first-order authorization. A restart, account switch, or risk-policy
+change disarms and invalidates LIVE permission. No real-money order was placed
+or tested during this implementation.
 
 The optional console analysis is:
 
@@ -186,8 +207,12 @@ The optional console analysis is:
   subsequent completed MT5 candles. It is not actual trade history.
 - **Data Quality Monitor:** displays validated completed MT5 candles and
   checks live quote freshness.
-- **Execution Safety:** configures operating mode and validated risk limits,
-  shows account/baseline/lockout state, and exposes guarded DEMO controls.
+- **Account Management:** stores multiple account profiles, securely saves
+  MT5 passwords, connects/switches/verifies accounts, selects operating mode,
+  performs GitHub device-flow authentication, and presents guarded LIVE
+  readiness/activation controls.
+- **Execution Safety:** configures validated risk limits, shows
+  account/baseline/lockout state, and exposes guarded execution controls.
 - **Trade History & Performance:** reports only closed trades reconciled
   against broker deal history. Cumulative realized P/L is not an equity curve.
 - MT5 server timestamps are normalized to UTC when a positive quarter-hour
@@ -221,6 +246,8 @@ Run the offline automated tests:
 
 ```powershell
 & '.\venv\Scripts\python.exe' -m pytest -q
+& '.\venv\Scripts\python.exe' -m compileall -q core dashboard execution risk tests
+& '.\venv\Scripts\python.exe' -m pip check
 ```
 
 Check dependency compatibility:
@@ -229,8 +256,7 @@ Check dependency compatibility:
 & '.\venv\Scripts\python.exe' -m pip check
 ```
 
-Execution and account-connection unit tests use mocked MT5 responses only. A
-previous read-only terminal check predates the Account Connections page; no
+Execution and account-connection unit tests use mocked MT5 responses only. No
 terminal identity verification or order submission was performed for this
 implementation. Mocked tests do not establish broker acceptance, actual stop
-placement, fill behavior, or live readiness.
+placement, fill behavior, or LIVE readiness.

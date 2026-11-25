@@ -270,7 +270,7 @@ def test_live_profile_cannot_enable_backend_execution(tmp_path):
     )
     engine.verify_account_connection()
 
-    with pytest.raises(TradeRejected, match="LIVE execution is disabled"):
+    with pytest.raises(TradeRejected, match="GitHub authorization"):
         engine.enable_execution(operator_confirmed=True)
 
     assert store.get_operational_config()["execution_enabled"] is False

@@ -106,6 +106,38 @@ class TradingStore:
                     )
                 );
 
+                CREATE TABLE IF NOT EXISTS account_profiles (
+                    profile_id TEXT PRIMARY KEY,
+                    login INTEGER NOT NULL CHECK (login > 0),
+                    broker_server TEXT NOT NULL,
+                    account_type TEXT NOT NULL
+                        CHECK (account_type IN ('DEMO', 'LIVE')),
+                    credential_ref TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(login, broker_server, account_type)
+                );
+
+                CREATE TABLE IF NOT EXISTS account_manager_state (
+                    state_id INTEGER PRIMARY KEY CHECK (state_id = 1),
+                    active_profile_id TEXT,
+                    github_client_id TEXT,
+                    github_authorized_login TEXT,
+                    github_authorized_at TEXT,
+                    github_account_login INTEGER,
+                    github_account_server TEXT,
+                    live_activated_at TEXT,
+                    live_activated_by TEXT,
+                    live_account_login INTEGER,
+                    live_account_server TEXT,
+                    live_risk_policy_hash TEXT,
+                    live_risk_acknowledged_at TEXT,
+                    live_real_money_acknowledged_at TEXT,
+                    live_first_order_authorized_at TEXT,
+                    live_first_order_submitted_at TEXT
+                );
+                INSERT OR IGNORE INTO account_manager_state (state_id) VALUES (1);
+
                 CREATE TABLE IF NOT EXISTS daily_baselines (
                     trading_date TEXT PRIMARY KEY,
                     starting_equity REAL NOT NULL CHECK (starting_equity > 0),
@@ -242,6 +274,59 @@ class TradingStore:
                 """,
                 (self._now(),),
             )
+            account_row = connection.execute(
+                "SELECT expected_login, broker_server, account_type "
+                "FROM account_connections WHERE config_id = 1"
+            ).fetchone()
+            if (
+                account_row is not None
+                and account_row["expected_login"] is not None
+                and account_row["broker_server"]
+                and account_row["account_type"]
+            ):
+                existing_profile = connection.execute(
+                    """
+                    SELECT profile_id FROM account_profiles
+                    WHERE login = ? AND broker_server = ? AND account_type = ?
+                    """,
+                    (
+                        account_row["expected_login"],
+                        account_row["broker_server"],
+                        account_row["account_type"],
+                    ),
+                ).fetchone()
+                manager_state = connection.execute(
+                    "SELECT active_profile_id FROM account_manager_state "
+                    "WHERE state_id = 1"
+                ).fetchone()
+                if existing_profile is None:
+                    profile_id = str(uuid.uuid4())
+                    now = self._now()
+                    connection.execute(
+                        """
+                        INSERT INTO account_profiles
+                            (profile_id, login, broker_server, account_type,
+                             created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            profile_id,
+                            account_row["expected_login"],
+                            account_row["broker_server"],
+                            account_row["account_type"],
+                            now,
+                            now,
+                        ),
+                    )
+                    existing_profile = {"profile_id": profile_id}
+                if manager_state is not None and manager_state["active_profile_id"] is None:
+                    connection.execute(
+                        """
+                        UPDATE account_manager_state SET active_profile_id = ?
+                        WHERE state_id = 1
+                        """,
+                        (existing_profile["profile_id"],),
+                    )
             config = connection.execute(
                 "SELECT config_id FROM operational_config WHERE config_id = 1"
             ).fetchone()
@@ -269,6 +354,17 @@ class TradingStore:
             if "runner_start_until" not in columns:
                 connection.execute(
                     "ALTER TABLE safety_state ADD COLUMN runner_start_until REAL"
+                )
+            manager_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(account_manager_state)"
+                )
+            }
+            if "live_real_money_acknowledged_at" not in manager_columns:
+                connection.execute(
+                    "ALTER TABLE account_manager_state ADD COLUMN "
+                    "live_real_money_acknowledged_at TEXT"
                 )
             config_columns = {
                 row["name"]
@@ -377,6 +473,9 @@ class TradingStore:
             account_row = connection.execute(
                 "SELECT * FROM account_connections WHERE config_id = 1"
             ).fetchone()
+            manager_row = connection.execute(
+                "SELECT * FROM account_manager_state WHERE state_id = 1"
+            ).fetchone()
         if row is None:
             raise RuntimeError("Trading configuration has not been initialized.")
         if account_row is None:
@@ -396,7 +495,491 @@ class TradingStore:
             "risk_policy": policy.to_dict(),
             "updated_at": row["updated_at"],
             "account_connection": self._account_connection_record(account_row),
+            "account_manager": self._account_manager_record(manager_row),
         }
+
+    @staticmethod
+    def _account_manager_record(row):
+        if row is None:
+            raise RuntimeError("Account manager configuration is unavailable.")
+        return {
+            "active_profile_id": row["active_profile_id"],
+            "github_client_id": row["github_client_id"],
+            "github_authorized_login": row["github_authorized_login"],
+            "github_authorized_at": row["github_authorized_at"],
+            "github_account_login": row["github_account_login"],
+            "github_account_server": row["github_account_server"],
+            "live_activated_at": row["live_activated_at"],
+            "live_activated_by": row["live_activated_by"],
+            "live_account_login": row["live_account_login"],
+            "live_account_server": row["live_account_server"],
+            "live_risk_policy_hash": row["live_risk_policy_hash"],
+            "live_risk_acknowledged_at": row["live_risk_acknowledged_at"],
+            "live_real_money_acknowledged_at": (
+                row["live_real_money_acknowledged_at"]
+            ),
+            "live_first_order_authorized_at": (
+                row["live_first_order_authorized_at"]
+            ),
+            "live_first_order_submitted_at": (
+                row["live_first_order_submitted_at"]
+            ),
+        }
+
+    def get_account_manager_state(self):
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM account_manager_state WHERE state_id = 1"
+            ).fetchone()
+        return self._account_manager_record(row)
+
+    @staticmethod
+    def _account_profile_record(row):
+        if row is None:
+            return None
+        return {
+            "profile_id": row["profile_id"],
+            "login": row["login"],
+            "server": row["broker_server"],
+            "account_type": row["account_type"],
+            "credential_ref": row["credential_ref"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def list_account_profiles(self):
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT profile_id, login, broker_server, account_type,
+                       credential_ref, created_at, updated_at
+                FROM account_profiles
+                ORDER BY updated_at DESC, profile_id
+                """
+            ).fetchall()
+        return [self._account_profile_record(row) for row in rows]
+
+    def get_account_profile(self, profile_id):
+        if not isinstance(profile_id, str) or not profile_id.strip():
+            raise ValueError("A valid account profile must be selected.")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT profile_id, login, broker_server, account_type,
+                       credential_ref, created_at, updated_at
+                FROM account_profiles WHERE profile_id = ?
+                """,
+                (profile_id.strip(),),
+            ).fetchone()
+        return self._account_profile_record(row)
+
+    def get_active_account_profile(self):
+        state = self.get_account_manager_state()
+        if state["active_profile_id"] is None:
+            return None
+        profile = self.get_account_profile(state["active_profile_id"])
+        if profile is None:
+            raise RuntimeError("The active account profile is missing.")
+        return profile
+
+    def save_account_profile(self, login, broker_server, account_type):
+        profile = normalize_account_profile(login, broker_server, account_type)
+        now = self._now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT profile_id, login, broker_server, account_type,
+                       credential_ref, created_at, updated_at
+                FROM account_profiles
+                WHERE login = ? AND broker_server = ? AND account_type = ?
+                """,
+                (profile["login"], profile["server"], profile["account_type"]),
+            ).fetchone()
+            if row is None:
+                profile_id = str(uuid.uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO account_profiles
+                        (profile_id, login, broker_server, account_type,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        profile_id,
+                        profile["login"],
+                        profile["server"],
+                        profile["account_type"],
+                        now,
+                        now,
+                    ),
+                )
+                row = connection.execute(
+                    """
+                    SELECT profile_id, login, broker_server, account_type,
+                           credential_ref, created_at, updated_at
+                    FROM account_profiles WHERE profile_id = ?
+                    """,
+                    (profile_id,),
+                ).fetchone()
+        return self._account_profile_record(row)
+
+    def set_account_profile_credential_ref(self, profile_id, credential_ref):
+        if (
+            not isinstance(profile_id, str)
+            or not profile_id.strip()
+            or credential_ref != profile_id
+        ):
+            raise ValueError("The secure credential reference is invalid.")
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE account_profiles
+                SET credential_ref = ?, updated_at = ?
+                WHERE profile_id = ?
+                """,
+                (credential_ref, self._now(), profile_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("The selected account profile does not exist.")
+
+    def activate_account_profile(self, profile_id):
+        profile = self.get_account_profile(profile_id)
+        if profile is None:
+            raise ValueError("The selected account profile does not exist.")
+        current = self.get_account_connection()
+        identity = {
+            "login": profile["login"],
+            "server": profile["server"],
+            "account_type": profile["account_type"],
+        }
+        if current is None:
+            self.save_account_connection(**{
+                "login": identity["login"],
+                "broker_server": identity["server"],
+                "account_type": identity["account_type"],
+            })
+        elif any(current[key] != identity[key] for key in identity):
+            self.switch_account_connection(
+                identity["login"],
+                identity["server"],
+                identity["account_type"],
+            )
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE account_manager_state SET active_profile_id = ?
+                WHERE state_id = 1
+                """,
+                (profile_id,),
+            )
+        return self.get_account_profile(profile_id)
+
+    def save_github_client_id(self, client_id):
+        import re
+
+        if (
+            not isinstance(client_id, str)
+            or re.fullmatch(r"[A-Za-z0-9._-]{10,128}", client_id.strip()) is None
+        ):
+            raise ValueError("Enter a valid public GitHub OAuth client ID.")
+        client_id = client_id.strip()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT github_client_id FROM account_manager_state "
+                "WHERE state_id = 1"
+            ).fetchone()
+            if row["github_client_id"] != client_id:
+                connection.execute(
+                    """
+                    UPDATE account_manager_state
+                    SET github_client_id = ?,
+                        github_authorized_login = NULL,
+                        github_authorized_at = NULL,
+                        github_account_login = NULL,
+                        github_account_server = NULL,
+                        live_activated_at = NULL,
+                        live_activated_by = NULL,
+                        live_account_login = NULL,
+                        live_account_server = NULL,
+                        live_risk_policy_hash = NULL,
+                        live_risk_acknowledged_at = NULL,
+                        live_real_money_acknowledged_at = NULL,
+                        live_first_order_authorized_at = NULL,
+                        live_first_order_submitted_at = NULL
+                    WHERE state_id = 1
+                    """,
+                    (client_id,),
+                )
+                connection.execute(
+                    """
+                    UPDATE operational_config
+                    SET execution_enabled = 0, updated_at = ?
+                    WHERE config_id = 1
+                    """,
+                    (self._now(),),
+                )
+        return client_id
+
+    def save_github_authorization(self, login, account_login, account_server):
+        if (
+            not isinstance(login, str)
+            or login.casefold() != "silas-afk"
+        ):
+            raise PermissionError("GitHub account is not authorized.")
+        account = self.get_account_connection()
+        if (
+            account is None
+            or not account["verified"]
+            or account["login"] != account_login
+            or account["server"] != account_server
+        ):
+            raise ValueError(
+                "Verify the active MT5 account before GitHub authorization."
+            )
+        now = self._now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE account_manager_state
+                SET github_authorized_login = ?, github_authorized_at = ?,
+                    github_account_login = ?, github_account_server = ?,
+                    live_activated_at = NULL, live_activated_by = NULL,
+                    live_account_login = NULL, live_account_server = NULL,
+                    live_risk_policy_hash = NULL,
+                    live_risk_acknowledged_at = NULL,
+                    live_real_money_acknowledged_at = NULL,
+                    live_first_order_authorized_at = NULL,
+                    live_first_order_submitted_at = NULL
+                WHERE state_id = 1
+                """,
+                ("Silas-AFK", now, account_login, account_server),
+            )
+            connection.execute(
+                """
+                UPDATE operational_config SET execution_enabled = 0,
+                    updated_at = ? WHERE config_id = 1
+                """,
+                (now,),
+            )
+        return now
+
+    def clear_github_authorization(self):
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE account_manager_state
+                SET github_authorized_login = NULL,
+                    github_authorized_at = NULL,
+                    github_account_login = NULL,
+                    github_account_server = NULL,
+                    live_activated_at = NULL, live_activated_by = NULL,
+                    live_account_login = NULL, live_account_server = NULL,
+                    live_risk_policy_hash = NULL,
+                    live_risk_acknowledged_at = NULL,
+                    live_real_money_acknowledged_at = NULL,
+                    live_first_order_authorized_at = NULL,
+                    live_first_order_submitted_at = NULL
+                WHERE state_id = 1
+                """
+            )
+            connection.execute(
+                """
+                UPDATE operational_config SET execution_enabled = 0,
+                    updated_at = ? WHERE config_id = 1
+                """,
+                (self._now(),),
+            )
+
+    def record_live_activation(
+        self,
+        *,
+        operator,
+        account_login,
+        account_server,
+        risk_policy_hash,
+        risk_acknowledged,
+        real_money_acknowledged,
+    ):
+        if (
+            not isinstance(operator, str)
+            or operator.casefold() != "silas-afk"
+            or risk_acknowledged is not True
+            or real_money_acknowledged is not True
+            or not isinstance(risk_policy_hash, str)
+            or len(risk_policy_hash) != 64
+        ):
+            raise ValueError("LIVE activation requirements are incomplete.")
+        operator = "Silas-AFK"
+        account = self.get_account_connection()
+        settings = self.get_operational_config()
+        manager = settings["account_manager"]
+        expected_risk_hash = hashlib.sha256(
+            json.dumps(settings["risk_policy"], sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        if (
+            settings["mode"] != "LIVE"
+            or account is None
+            or account["account_type"] != "LIVE"
+            or not account["verified"]
+            or account["login"] != account_login
+            or account["server"] != account_server
+            or manager["github_authorized_login"] != "Silas-AFK"
+            or manager["github_account_login"] != account_login
+            or manager["github_account_server"] != account_server
+            or manager["github_authorized_at"] is None
+            or risk_policy_hash != expected_risk_hash
+        ):
+            raise ValueError("LIVE account or operator verification is stale.")
+        now = self._now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE account_manager_state
+                SET live_activated_at = ?, live_activated_by = ?,
+                    live_account_login = ?, live_account_server = ?,
+                    live_risk_policy_hash = ?, live_risk_acknowledged_at = ?,
+                    live_real_money_acknowledged_at = ?,
+                    live_first_order_authorized_at = NULL,
+                    live_first_order_submitted_at = NULL
+                WHERE state_id = 1
+                """,
+                (
+                    now,
+                    operator,
+                    account_login,
+                    account_server,
+                    risk_policy_hash,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO execution_events
+                    (severity, event_type, detail, created_at)
+                VALUES ('CRITICAL', 'LIVE_ACTIVATED', ?, ?)
+                """,
+                (
+                    f"GitHub operator {operator} activated LIVE for account "
+                    f"****{str(account_login)[-4:]} @ {account_server}.",
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE operational_config SET execution_enabled = 0,
+                    updated_at = ? WHERE config_id = 1
+                """,
+                (now,),
+            )
+        return now
+
+    @staticmethod
+    def _clear_live_state(connection):
+        connection.execute(
+            """
+            UPDATE account_manager_state
+            SET live_activated_at = NULL, live_activated_by = NULL,
+                live_account_login = NULL, live_account_server = NULL,
+                live_risk_policy_hash = NULL,
+                live_risk_acknowledged_at = NULL,
+                live_real_money_acknowledged_at = NULL,
+                live_first_order_authorized_at = NULL,
+                live_first_order_submitted_at = NULL
+            WHERE state_id = 1
+            """
+        )
+
+    @staticmethod
+    def _clear_account_authorization(connection):
+        connection.execute(
+            """
+            UPDATE account_manager_state
+            SET github_authorized_login = NULL,
+                github_authorized_at = NULL,
+                github_account_login = NULL,
+                github_account_server = NULL,
+                live_activated_at = NULL, live_activated_by = NULL,
+                live_account_login = NULL, live_account_server = NULL,
+                live_risk_policy_hash = NULL,
+                live_risk_acknowledged_at = NULL,
+                live_real_money_acknowledged_at = NULL,
+                live_first_order_authorized_at = NULL,
+                live_first_order_submitted_at = NULL
+            WHERE state_id = 1
+            """
+        )
+
+    def deactivate_account_profile(self):
+        self.clear_account_connection()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE account_manager_state SET active_profile_id = NULL
+                WHERE state_id = 1
+                """
+            )
+        return True
+
+    def authorize_first_live_order(
+        self,
+        *,
+        operator_confirmed,
+        account_login,
+        account_server,
+    ):
+        if operator_confirmed is not True:
+            raise PermissionError("Separate first-order confirmation is required.")
+        manager = self.get_account_manager_state()
+        if (
+            manager["live_activated_at"] is None
+            or manager["live_account_login"] != account_login
+            or manager["live_account_server"] != account_server
+            or manager["live_first_order_submitted_at"] is not None
+        ):
+            raise ValueError("A current LIVE activation is required.")
+        now = self._now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE account_manager_state
+                SET live_first_order_authorized_at = ?
+                WHERE state_id = 1
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                INSERT INTO execution_events
+                    (severity, event_type, detail, created_at)
+                VALUES ('CRITICAL', 'LIVE_FIRST_ORDER_AUTHORIZED', ?, ?)
+                """,
+                (
+                    f"First LIVE order separately authorized for account "
+                    f"****{str(account_login)[-4:]} @ {account_server}.",
+                    now,
+                ),
+            )
+        return now
+
+    def mark_first_live_order_submitted(self, account_login, account_server):
+        manager = self.get_account_manager_state()
+        if (
+            manager["live_first_order_authorized_at"] is None
+            or manager["live_account_login"] != account_login
+            or manager["live_account_server"] != account_server
+        ):
+            raise ValueError("The first LIVE order is not separately authorized.")
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE account_manager_state
+                SET live_first_order_submitted_at = ?
+                WHERE state_id = 1 AND live_first_order_submitted_at IS NULL
+                """,
+                (self._now(),),
+            )
 
     @staticmethod
     def _account_connection_record(row):
@@ -515,6 +1098,29 @@ class TradingStore:
                     """,
                     (now,),
                 )
+                active_profile = connection.execute(
+                    """
+                    SELECT profile_id FROM account_profiles
+                    WHERE login = ? AND broker_server = ? AND account_type = ?
+                    """,
+                    (
+                        profile["login"],
+                        profile["server"],
+                        profile["account_type"],
+                    ),
+                ).fetchone()
+                connection.execute(
+                    """
+                    UPDATE account_manager_state SET active_profile_id = ?
+                    WHERE state_id = 1
+                    """,
+                    (
+                        active_profile["profile_id"]
+                        if active_profile is not None
+                        else None,
+                    ),
+                )
+                self._clear_account_authorization(connection)
         return self.get_account_connection()
 
     def save_account_connection(self, login, broker_server, account_type):
@@ -580,10 +1186,24 @@ class TradingStore:
             connection.execute(
                 """
                 UPDATE operational_config
-                SET execution_enabled = 0, updated_at = ?
+                SET agent_enabled = 0, execution_enabled = 0,
+                    runner_enabled = 0, updated_at = ?
                 WHERE config_id = 1
                 """,
                 (now,),
+            )
+            connection.execute(
+                """
+                UPDATE account_manager_state
+                SET live_activated_at = NULL, live_activated_by = NULL,
+                    live_account_login = NULL, live_account_server = NULL,
+                    live_risk_policy_hash = NULL,
+                    live_risk_acknowledged_at = NULL,
+                    live_real_money_acknowledged_at = NULL,
+                    live_first_order_authorized_at = NULL,
+                    live_first_order_submitted_at = NULL
+                WHERE state_id = 1
+                """
             )
 
     def clear_account_connection(self):
@@ -622,6 +1242,13 @@ class TradingStore:
                     """,
                     (now,),
                 )
+                connection.execute(
+                    """
+                    UPDATE account_manager_state SET active_profile_id = NULL
+                    WHERE state_id = 1
+                    """
+                )
+                self._clear_account_authorization(connection)
 
     def update_operational_config(
         self,
@@ -687,6 +1314,8 @@ class TradingStore:
                     now,
                 ),
             )
+            if mode_changed or risk_policy is not None:
+                self._clear_live_state(connection)
         return self.get_operational_config()
 
     def disarm_after_restart(self):
@@ -709,6 +1338,17 @@ class TradingStore:
                 """,
                 (mode, self._now()),
             )
+            connection.execute(
+                """
+                UPDATE account_connections
+                SET verified_login = NULL, verified_server = NULL,
+                    verified_account_type = NULL, verified_at = NULL,
+                    updated_at = ?
+                WHERE config_id = 1
+                """,
+                (self._now(),),
+            )
+            self._clear_account_authorization(connection)
 
     def set_agent_enabled(self, enabled):
         if not isinstance(enabled, bool):

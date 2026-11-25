@@ -49,6 +49,8 @@ class FakeMT5:
     ORDER_TIME_GTC = 0
     TRADE_RETCODE_DONE = 10009
     TRADE_RETCODE_DONE_PARTIAL = 10010
+    TRADE_RETCODE_REJECT = 10006
+    TRADE_RETCODE_TIMEOUT = 10012
     TIMEFRAME_M15 = 15
     DEAL_ENTRY_IN = 0
     DEAL_ENTRY_OUT = 1
@@ -340,12 +342,29 @@ def test_live_mode_requires_all_readiness_evidence_and_explicit_authorization(
             "live_authorized": True,
         }
     )
-    assert all(read_live_readiness(readiness_file).values())
+    readiness["account_identity_verified"].update({
+        "account_login": 123456,
+        "account_server": "Broker-Demo",
+    })
+    readiness_file.write_text(
+        json.dumps(readiness),
+        encoding="utf-8",
+    )
+    assert all(
+        read_live_readiness(
+            readiness_file,
+            account_login=123456,
+            account_server="Broker-Demo",
+        ).values()
+    )
     live_reasons = permission_reasons(
         live_config,
         {"verified": True, "reasons": []},
     )
-    assert any("LIVE execution is disabled" in reason for reason in live_reasons)
+    assert any(
+        "first LIVE order" in reason or "GitHub" in reason
+        for reason in live_reasons
+    )
 
     monkeypatch.delenv("NEXORA_LIVE_AUTHORIZATION")
     assert any(
@@ -374,6 +393,15 @@ def test_environment_defaults_fail_closed_and_risk_values_are_bounded(monkeypatc
     assert config.max_daily_loss_percent == 1.0
     assert config.max_aggregate_stop_risk_percent == 0.5
     assert config.max_open_positions == 2
+
+    monkeypatch.setenv(
+        "NEXORA_LIVE_AUTHORIZATION",
+        "I_EXPLICITLY_AUTHORIZE_LIVE_TRADING",
+    )
+    live_settings = OperatingConfig.from_environment(
+        settings={"mode": "LIVE"},
+    )
+    assert live_settings.live_authorized is False
 
     monkeypatch.setenv("NEXORA_RISK_PERCENT", "0.26")
     with pytest.raises(OperatingModeError, match="no greater than 0.25"):
@@ -652,6 +680,87 @@ def test_adverse_fill_slippage_cannot_exceed_risk_budget(tmp_path):
     assert api.positions == []
     assert engine.store.get_lockout()["active"] is True
     assert engine.store.list_trades()[0]["status"] == "SLIPPAGE_LIMIT_BREACH_CLOSED"
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["no_response", "timeout_without_position", "timeout_retcode"],
+)
+def test_ambiguous_order_outcome_stays_pending_and_blocks_retries(
+    tmp_path,
+    outcome,
+):
+    engine, api = _engine(tmp_path)
+    if outcome == "no_response":
+        api.order_send = lambda _request: None
+    elif outcome == "timeout_retcode":
+        api.order_send = lambda _request: SimpleNamespace(
+            retcode=api.TRADE_RETCODE_TIMEOUT,
+            comment="timeout",
+        )
+    else:
+        def timeout(_request):
+            raise TimeoutError("broker response timed out")
+
+        api.order_send = timeout
+
+    with pytest.raises(TradeRejected, match="outcome"):
+        engine.submit_signal(
+            "EURUSD",
+            _signal(),
+            signal_id=f"ambiguous-{outcome}",
+        )
+
+    trade = engine.store.list_trades()[0]
+    assert trade["status"] == "PENDING_CONFIRMATION"
+    assert engine.store.get_lockout()["active"] is True
+    with pytest.raises(TradeRejected, match="lockout"):
+        engine.submit_signal(
+            "EURUSD",
+            _signal(),
+            signal_id="different-signal-after-timeout",
+        )
+    assert trade["status"] == "PENDING_CONFIRMATION"
+
+
+def test_explicit_broker_rejection_is_not_misclassified_as_timeout(tmp_path):
+    engine, api = _engine(tmp_path)
+    api.order_send = lambda _request: SimpleNamespace(
+        retcode=api.TRADE_RETCODE_REJECT,
+        comment="request rejected",
+    )
+
+    with pytest.raises(TradeRejected, match="request rejected"):
+        engine.submit_signal(
+            "EURUSD",
+            _signal(),
+            signal_id="explicit-rejection",
+        )
+
+    assert engine.store.list_trades()[0]["status"] == "REJECTED"
+    assert engine.store.get_lockout()["active"] is False
+
+
+def test_order_send_timeout_reconciles_actual_fill_before_failing(tmp_path):
+    engine, api = _engine(tmp_path)
+    send = api.order_send
+
+    def execute_then_timeout(request):
+        send(request)
+        raise TimeoutError("response was lost after fill")
+
+    api.order_send = execute_then_timeout
+    result = engine.submit_signal(
+        "EURUSD",
+        _signal(),
+        signal_id="fill-after-timeout",
+    )
+
+    assert result["submitted"] is True
+    assert result["protected"] is True
+    assert result["trade"]["status"] == "OPEN"
+    assert len(api.positions) == 1
+    assert engine.store.get_lockout()["active"] is False
 
 
 def test_emergency_lockout_blocks_entries_and_requires_flat_account_to_clear(
